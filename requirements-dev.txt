@@ -16,7 +16,7 @@
 # No va en producción: Render no lo despliega, y los docker compose usan la
 # imagen mher/flower. Estaba en requirements.txt y viajaba a la imagen, con su
 # servidor web (tornado) incluido, sin que nada lo usara.
-flower==2.0.1
+flower==2.2.0
 
 # --- Suite de tests ---
 pytest==9.1.1
