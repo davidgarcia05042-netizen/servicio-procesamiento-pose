@@ -1,0 +1,460 @@
+# Blueprint de Render: los tres procesos del servicio, la cola y la base.
+#
+# Se crea desde el Dashboard de Render con "New > Blueprint" apuntando a este
+# repositorio. Render lee este archivo y levanta todo junto, en vez de crear
+# cinco recursos a mano y mantener sincronizadas sus variables.
+#
+# Render construye la imagen desde este repositorio (la etapa `render` del
+# Dockerfile, que es la última) y despliega cada commit de main solo después
+# de que pasan sus checks de GitHub (`autoDeployTrigger: checksPass`).
+#
+# LA BASE ES RENDER, LOS VIDEOS VAN A SUPABASE STORAGE (2026-10-16): la base
+# de los jobs es la Render Postgres de abajo (`pose-db`), y los videos esperan
+# en un bucket privado de Supabase Storage hasta que el worker los procesa y
+# los borra (STORAGE_BACKEND=supabase; ver app/platforms/render/supabase_storage.py
+# y README, "Los videos en Supabase Storage").
+#
+# Antes (2026-10-08 a 2026-10-16) los videos esperaban en la misma pose-db
+# (STORAGE_BACKEND=postgres). En la prueba de punta a punta con la plataforma,
+# guardar un video de celular como bytea agotó la memoria de pose-db
+# (basic-256mb): la base se reiniciaba en cada subida ("database system was not
+# properly shut down") y, sin base, /health daba 503 y Render reiniciaba la API.
+#
+# LO QUE ESTE ARCHIVO NO PUEDE HACER, y hay que hacer a mano (ver README,
+# sección "Despliegue en Render"):
+#   - darle a Render acceso a este repositorio privado (la app de GitHub de
+#     Render);
+#   - cargar SUPABASE_SECRET_KEY en pose-api y en pose-worker. Es el único
+#     secreto que no sale del blueprint (ver su comentario en pose-api). La URL
+#     de la base la entrega Render y la clave HMAC la genera.
+#
+# NOTA DE COSTOS: acá NO hay nada en plan gratuito, y es deliberado.
+#
+#   - Los Background Workers de Render no existen en gratuito, y
+#     `preDeployCommand` tampoco esta disponible en instancias gratuitas: o sea
+#     que pose-api, pose-worker y pose-beat son de pago sí o sí.
+#   - Que la cuenta tenga un plan de pago NO rescata a un recurso puesto en
+#     plan gratuito. Render: "Upgrading your workspace plan does not remove
+#     limitations on Free instances.".
+#   - La Key Value gratuita pierde todo lo encolado en cada reinicio: es una
+#     forma de perder videos en silencio. Ver su comentario abajo.
+#   - La base gratuita de Render vence a los 30 días y se borra.
+
+# Todo lo que comparten los tres procesos. Un grupo en vez de repetir la lista
+# tres veces: si un valor cambia, cambia en un solo lugar y no hay forma de que
+# un proceso quede desalineado con los otros.
+#
+# OJO: un grupo NO puede contener `fromDatabase`, `fromService` ni
+# `sync: false` (Render ignora en silencio una variable `sync: false` de un
+# grupo). Por eso DATABASE_URL, las URLs de Redis y SUPABASE_SECRET_KEY van
+# por servicio.
+envVarGroups:
+  - name: pose-config
+    envVars:
+      # Activa las comprobaciones de producción de app/core/config.py, entre
+      # ellas la que exige que Redis no viaje en texto plano fuera de la red
+      # interna de Render.
+      - key: ENVIRONMENT
+        value: production
+
+      # --- Almacenamiento del video: Supabase Storage ---
+      # El video espera en un bucket PRIVADO de Supabase y el worker lo borra
+      # al cerrar el job. No en pose-db: un video de celular guardado como
+      # bytea agotaba los 256 MB de la base (ver el encabezado). La base de
+      # Render y Firebase siguen disponibles en el código (ver
+      # app/platforms/render/__init__.py y README).
+      - key: STORAGE_BACKEND
+        value: supabase
+      # La URL del proyecto no es secreta (la clave sí, y va por servicio: ver
+      # SUPABASE_SECRET_KEY en pose-api).
+      - key: SUPABASE_URL
+        value: https://eytjjlcthcghftlwxgab.supabase.co
+      # Privado: nada se sirve públicamente; la API y el worker entran con la
+      # clave secreta del proyecto.
+      - key: SUPABASE_STORAGE_BUCKET
+        value: pose-videos
+
+      # --- HMAC con la plataforma de telefisioterapia ---
+      # generateValue: Render genera un secreto fuerte UNA vez y se lo entrega
+      # igual a los tres servicios. Se prefiere a `sync: false` por dos razones:
+      # un grupo no admite `sync: false`, y si se pusiera por servicio Render
+      # preguntaría tres veces, con el riesgo de que queden tres secretos
+      # distintos y el callback firmado con uno que la plataforma no conoce.
+      # Una vez creado se lee en el Dashboard y se le pasa a la plataforma.
+      - key: HMAC_SECRET
+        generateValue: true
+      # true: la plataforma conectada (2026-10-16) firma cada envío con este
+      # mismo secreto (esquema de app/utils/hmac_auth.py, ver "Bloqueadores
+      # resueltos" en docs/DECISIONES_TECNICAS.md), así que no hay razón para aceptar
+      # solicitudes sin firma de cualquiera que encuentre la URL.
+      - key: HMAC_ENFORCE
+        value: "true"
+      - key: HMAC_MAX_SKEW_SECONDS
+        value: "300"
+
+      # --- Límites de entrada ---
+      # 50 alcanza: los videos de TOMA FRONTAL pesan 28-43 MB (11-17 s), y uno
+      # de 50 MB son ~20 s con esa calidad. Cada video llega a estar varias
+      # veces en la memoria de la API al recibirlo (ver su plan, abajo): para
+      # subir este límite hay que volver a medir la API con videos de ese
+      # tamaño llegando a la vez.
+      - key: MAX_VIDEO_SIZE_MB
+        value: "50"
+      - key: RATE_LIMIT_VIDEO
+        value: 10/minute
+
+      # --- Observabilidad ---
+      # El nivel del log vive acá y NO en la línea de comandos a propósito:
+      # bajarlo a DEBUG para diagnosticar un incidente se hace editando la
+      # variable, sin tocar el blueprint ni volver a desplegar.
+      - key: LOG_LEVEL
+        value: INFO
+      # Cada cuánto el worker emite el resumen de estado, y qué ventana cubre.
+      # La ventana es más ancha que el intervalo para que dos resúmenes
+      # consecutivos se solapen y un retraso de Beat no deje un hueco.
+      - key: STATUS_REPORT_INTERVAL_MINUTES
+        value: "15"
+      - key: STATUS_REPORT_WINDOW_MINUTES
+        value: "60"
+
+      # --- A dónde puede enviarse el callback ---
+      # Plataforma conectada (2026-10-16): solo el backend de la plataforma de
+      # telefisioterapia en Render, exactamente el host, sin esquema. Se sacó
+      # webhook.site, que era el destino de la fase de pruebas aisladas.
+      # Nunca vacío: vacío significa "sin lista", que acepta cualquier destino
+      # público.
+      - key: CALLBACK_ALLOWED_HOSTS
+        value: platform-api-4qtl.onrender.com
+
+      # --- Reintentos de callbacks ---
+      # La hora de cada reintento vive en PostgreSQL; el despachador busca
+      # cada tantos segundos los que ya vencieron y los encola.
+      - key: CALLBACK_DISPATCH_INTERVAL_SECONDS
+        value: "10"
+      # Pausa entre rondas de reintentos, y hasta cuándo se insiste (medido
+      # desde que entró el job). El tope importa: sin él, un endpoint mal
+      # configurado recibiría rondas de nueve intentos para siempre.
+      - key: CALLBACK_RETRY_INTERVAL_MINUTES
+        value: "60"
+      - key: CALLBACK_RETRY_WINDOW_HOURS
+        value: "72"
+      # Cuánto tiene que llevar un aviso en "pending" para darlo por perdido.
+      # TIENE QUE SUPERAR el visibility_timeout del broker (1 hora) más la
+      # espera en cola, o el rescate duplicaría una entrega que Redis estaba
+      # por re-entregar.
+      - key: CALLBACK_STALE_PENDING_HOURS
+        value: "3"
+      - key: CALLBACK_RETRY_BATCH_SIZE
+        value: "100"
+
+      # --- Retención de datos (Ley 1581 de 2012) ---
+      # Cuántos días se conservan los datos personales de un job ya cerrado.
+      # NO es una decisión técnica: depende de la política de tratamiento de
+      # datos de la plataforma y de cuánto tiempo necesite el equipo clínico
+      # poder consultar un resultado. 30 es un punto de partida conservador
+      # que hay que confirmar con quien responda por el tratamiento.
+      - key: DATA_RETENTION_DAYS
+        value: "30"
+      - key: RETENTION_SCAN_INTERVAL_HOURS
+        value: "24"
+      # Tope por corrida: sin él, la primera pasada sobre una base con historia
+      # acumulada intentaría borrar miles de videos en una sola tarea.
+      - key: RETENTION_BATCH_SIZE
+        value: "500"
+
+      # --- Procesamiento ---
+      - key: POSE_MODEL
+        value: mediapipe_heavy
+      # Provisionales: dependen de cuánto tarde un video real en este hardware,
+      # que es justo lo que mide app/tools/benchmark_pipeline.py. Se ajustan
+      # cuando haya mediciones acá, no antes.
+      - key: STUCK_JOB_TIMEOUT_MINUTES
+        value: "15"
+      - key: STUCK_JOB_SCAN_INTERVAL_MINUTES
+        value: "5"
+
+      # --- Conexiones a PostgreSQL ---
+      # Hasta 3 conexiones por proceso (2 + 1 en un pico). Sobra: cada proceso
+      # atiende pocas cosas a la vez. pose-db admite 100 (planes de menos de
+      # 8 GB de RAM), y en el peor momento de un despliegue conviven la API
+      # vieja, la nueva, los procesos del worker y el alembic del
+      # pre-despliegue. Beat no abre conexiones. Un test comprueba la suma.
+      - key: DB_POOL_SIZE
+        value: "2"
+      - key: DB_MAX_OVERFLOW
+        value: "1"
+
+services:
+  # --- API ---
+  - name: pose-api
+    type: web
+    runtime: docker
+    # Render construye la imagen desde el repositorio. Sin `--target`: construye
+    # la ÚLTIMA etapa del Dockerfile, que por eso es la de Render (ver ahí).
+    repo: https://github.com/davidgarcia05042-netizen/servicio-procesamiento-pose
+    branch: main
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    # Despliega cada commit de main solo cuando pasan TODOS sus checks de
+    # GitHub (la suite, el escaneo de seguridad): lo que corre es lo que pasó
+    # los tests. Si un check falla, ese commit no se despliega.
+    autoDeployTrigger: checksPass
+    # Solo lo que entra en la imagen. Un cambio en el README o en los tests no
+    # reconstruye nada (cada build de mediapipe + opencv tarda minutos, y son
+    # tres). Un test comprueba que cubra todo lo que copia el Dockerfile.
+    buildFilter:
+      paths:
+        - Dockerfile
+        - requirements/**
+        - alembic.ini
+        - alembic/**
+        - app/**
+    # La API solo recibe, valida y encola: el trabajo pesado es del worker.
+    # Pero cada video llega a estar varias veces en su memoria al recibirlo
+    # (el cuerpo para la firma, el contenido y el envío al almacenamiento): con dos
+    # videos de 47 MB a la vez llegó a 662 MiB (demo local, 2026-10-08). En
+    # 0.5c-512mb la instancia se reiniciaría y las dos subidas fallarían. 1c-2g
+    # (25 USD/mes, 18 más) aprobado por el grupo el 2026-10-09; Render no tiene
+    # un plan intermedio. Un test lo comprueba.
+    plan: 1c-2g
+    region: oregon
+    # /health sondea PostgreSQL y el broker antes de responder (ver
+    # app/api/health.py), así que un despliegue con la base mal configurada se
+    # cancela en vez de quedar en pie reportándose sano.
+    #
+    # Contrapartida asumida: con el servicio ya corriendo, 60 segundos de 503
+    # seguidos hacen que Render reinicie la instancia. Sin base de datos este
+    # servicio no puede aceptar un solo video, así que no hay nada que
+    # preservar manteniéndolo "sano".
+    healthCheckPath: /health
+    # Las migraciones corren acá y NO en el arranque del contenedor. El
+    # pre-despliegue se ejecuta una sola vez por despliegue, en una instancia
+    # aparte, antes de que la versión nueva reciba tráfico. Si fuera parte del
+    # comando de arranque, cada réplica intentaría migrar a la vez.
+    preDeployCommand: alembic upgrade head
+    # Render manda SIGTERM al desplegar y mata con SIGKILL pasado este plazo
+    # (por defecto 30 s). A la API le sobra: solo tiene que terminar de
+    # responder las solicitudes en curso, que son validar y encolar.
+    maxShutdownDelaySeconds: 60
+    envVars:
+      - fromGroup: pose-config
+      # uvicorn escucha en el 8000 (CMD del Dockerfile) y Render espera el
+      # 10000 por defecto. Su documentación dice que "usualmente" detecta otro
+      # puerto: con PORT explícito no depende de esa detección.
+      - key: PORT
+        value: "8000"
+      # La clave secreta del proyecto de Supabase (sb_secret_...), para el
+      # bucket privado de videos. El ÚNICO secreto que se carga a mano:
+      #   - No puede ir en pose-config: Render ignora `sync: false` en un grupo.
+      #   - Va en la API y en el worker, que son los que suben, leen y borran
+      #     videos (los dos la exigen al arrancar). Beat no: no toca el
+      #     almacenamiento.
+      #   - Render pide los `sync: false` solo al CREAR el blueprint. En uno ya
+      #     creado los ignora: hay que cargarla en el Dashboard, en cada uno de
+      #     los dos servicios, y con el mismo valor.
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      # La URL INTERNA de pose-db (host "dpg-...", sin dominio): va por la
+      # red privada de Render, así que app/core/config.py no le exige TLS.
+      # Viene como postgresql://, y config.py la ajusta para asyncpg.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: pose-db
+          property: connectionString
+      # El host interno de la Key Value tiene la forma "red-xxxx", sin dominio.
+      # app/core/config.py reconoce ese patrón y acepta ahí redis:// sin TLS,
+      # porque ese tráfico no sale de la red privada de Render.
+      #
+      # Broker y backend apuntan a la MISMA base (la 0), a diferencia del
+      # docker-compose local que usa 0 y 1: `fromService` entrega la URL
+      # completa y no hay dónde cambiarle el índice. No se pisan porque Celery
+      # y Kombu usan prefijos de clave distintos.
+      - key: REDIS_BROKER_URL
+        fromService:
+          type: keyvalue
+          name: pose-keyvalue
+          property: connectionString
+      - key: REDIS_BACKEND_URL
+        fromService:
+          type: keyvalue
+          name: pose-keyvalue
+          property: connectionString
+
+  # --- Worker: procesa los videos ---
+  - name: pose-worker
+    type: worker
+    runtime: docker
+    # El mismo repositorio, rama, Dockerfile y filtro que pose-api (ver el
+    # comentario allá): los tres procesos corren el mismo commit.
+    repo: https://github.com/davidgarcia05042-netizen/servicio-procesamiento-pose
+    branch: main
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeployTrigger: checksPass
+    buildFilter:
+      paths:
+        - Dockerfile
+        - requirements/**
+        - alembic.ini
+        - alembic/**
+        - app/**
+    # 4 CPU y 8 GB (aprobado por el grupo el 2026-10-09, 175 USD/mes; antes
+    # 2c-4g): cuatro videos a la vez en vez de dos. Mientras se prueba de a
+    # uno, el worker se suspende en el Dashboard entre pruebas (ver README,
+    # "Costos"): Render cobra solo mientras está encendido.
+    #
+    # Más núcleos dan más videos a la vez, no un video más rápido: cada
+    # proceso sigue usando un núcleo. La RAM sobra: en pose-benchmark (Render
+    # 2c-8g, 2026-10-01) el modelo que más usa, MediaPipe Heavy, llegó a
+    # 649 MB de pico por proceso; con cuatro procesos son ~2,6 GB, un tercio
+    # de 8 GB. El margen cubre la deriva de memoria entre jobs (ver
+    # MALLOC_ARENA_MAX abajo). Un test comprueba las dos cosas.
+    plan: 4c-8g
+    region: oregon
+    # --concurrency=4: uno por CPU. El procesamiento de video satura el núcleo,
+    # así que más procesos solo se estorbarían entre sí.
+    #
+    # Deja ~2 GB por proceso: cada uno carga su propia copia del grafo de
+    # MediaPipe más los buffers de decodificación de OpenCV. Un OOM-kill a
+    # mitad de un video es la falla que obliga a existir a todo el mecanismo de
+    # jobs atascados (app/core/stuck_jobs.py).
+    # Sin --loglevel: el nivel sale de LOG_LEVEL (ver app/platforms/render/worker.py,
+    # `_keep_our_logging`), para poder cambiarlo sin volver a desplegar.
+    dockerCommand: celery -A app.platforms.render.worker.celery worker --concurrency=4
+    # EL MÁXIMO QUE PERMITE RENDER (300 s), y acá sí importa.
+    #
+    # Al desplegar, Render manda SIGTERM y mata con SIGKILL pasado este plazo.
+    # Celery responde al SIGTERM con un apagado CALIENTE: deja de tomar tareas
+    # nuevas y espera a que terminen las que ya están corriendo. Con los 30
+    # segundos por defecto, cualquier video que no alcance a terminar en ese
+    # rato se corta a la mitad: el job queda en PROCESSING, lo cierra el
+    # barrido quince minutos después y a la plataforma le llega un fallo por
+    # un video que no tenía nada malo.
+    #
+    # Con 300 segundos, todo video que se procese en menos de cinco minutos
+    # termina normalmente durante el despliegue. Lo que tarde más sigue
+    # perdiéndose: Celery 5.4 no tiene forma de limitar el apagado caliente
+    # (worker_soft_shutdown_timeout llegó en 5.5), así que no hay manera de
+    # pedirle "termina en N segundos o abandona ordenadamente".
+    #
+    # Cuánto tarda de verdad un video acá lo dice app/tools/benchmark_pipeline.py.
+    maxShutdownDelaySeconds: 300
+    envVars:
+      - fromGroup: pose-config
+      # Cada job crea su propio modelo de MediaPipe en un proceso que vive
+      # mucho tiempo, y eso fragmenta las arenas de memoria de glibc: la RAM
+      # sube job a job (250 -> 559 MB en 12 jobs de MediaPipe Lite; pose-benchmark,
+      # Docker 2 CPU / 8 GB, 2026-09-28). Con 2 arenas se estabiliza en ~310 MB.
+      # No es una fuga de MediaPipe; es el asignador de memoria.
+      - key: MALLOC_ARENA_MAX
+        value: "2"
+      # La misma que en pose-api (ver el comentario allá).
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      # La misma que en pose-api (ver el comentario allá).
+      - key: DATABASE_URL
+        fromDatabase:
+          name: pose-db
+          property: connectionString
+      - key: REDIS_BROKER_URL
+        fromService:
+          type: keyvalue
+          name: pose-keyvalue
+          property: connectionString
+      - key: REDIS_BACKEND_URL
+        fromService:
+          type: keyvalue
+          name: pose-keyvalue
+          property: connectionString
+
+  # --- Beat: dispara el barrido de jobs atascados ---
+  - name: pose-beat
+    type: worker
+    runtime: docker
+    # El mismo repositorio, rama, Dockerfile y filtro que pose-api (ver el
+    # comentario allá): los tres procesos corren el mismo commit.
+    repo: https://github.com/davidgarcia05042-netizen/servicio-procesamiento-pose
+    branch: main
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeployTrigger: checksPass
+    buildFilter:
+      paths:
+        - Dockerfile
+        - requirements/**
+        - alembic.ini
+        - alembic/**
+        - app/**
+    # Solo publica una tarea cada pocos minutos: no necesita nada.
+    plan: 0.5c-512mb
+    region: oregon
+    dockerCommand: celery -A app.platforms.render.worker.celery beat
+    # Beat no ejecuta tareas, solo las publica: no hay nada en curso que
+    # esperar y el plazo por defecto sobra.
+    maxShutdownDelaySeconds: 30
+    # NUNCA escalar esto a más de una instancia: cada una publicaría la misma
+    # tarea periódica, y el barrido correría tantas veces como réplicas haya.
+    numInstances: 1
+    envVars:
+      - fromGroup: pose-config
+      # SIN DATABASE_URL, a propósito. Beat no abre conexiones a PostgreSQL
+      # (no dispara worker_process_init, que es la señal del worker), y
+      # `settings` arranca con el valor por defecto. Que no la tenga deja a la
+      # vista que no la necesita.
+      - key: REDIS_BROKER_URL
+        fromService:
+          type: keyvalue
+          name: pose-keyvalue
+          property: connectionString
+      - key: REDIS_BACKEND_URL
+        fromService:
+          type: keyvalue
+          name: pose-keyvalue
+          property: connectionString
+
+  # --- Cola (Redis) ---
+  - name: pose-keyvalue
+    type: keyvalue
+    # NO gratuito, a proposito. El plan gratuito de Key Value no guarda nada en
+    # disco y Render puede reiniciarlo cuando quiera: en cada reinicio se
+    # pierden TODAS las tareas encoladas.
+    #
+    # El barrido de jobs atascados rescata esos jobs (cubre `queued`), pero
+    # recién cuando vence su umbral de una hora: cada reinicio sería un lote
+    # de videos demorados y avisos de fallo a la plataforma. Los planes de
+    # pago traen persistencia en disco activada por defecto.
+    #
+    # Si se prefiere asumir ese riesgo para abaratar la prueba, se cambia por
+    # `plan: free` -- pero sabiendo que implica perder videos en silencio.
+    plan: 256mb
+    region: oregon
+    # Lista vacía = sin acceso desde fuera. Solo los servicios de arriba, por
+    # la red privada. Es lo que hace que redis:// sin TLS sea aceptable acá.
+    ipAllowList: []
+
+databases:
+  # --- Base de datos: los jobs (los videos van a Supabase Storage) ---
+  - name: pose-db
+    # 256 MB de RAM, 6 USD/mes. Admite 100 conexiones. NO el gratuito: vence a
+    # los 30 días y se borra con todo lo que tenga. Alcanza para los jobs; NO
+    # para los videos: con STORAGE_BACKEND=postgres un video de celular la
+    # dejaba sin memoria (2026-10-16).
+    plan: basic-256mb
+    # La misma región que los servicios: la red privada de Render no cruza
+    # regiones, y la URL interna de arriba solo resuelve dentro de ella. Un
+    # test lo comprueba.
+    region: oregon
+    # La misma versión que el docker-compose local y la CI.
+    postgresMajorVersion: "16"
+    databaseName: pose_service
+    user: pose
+    # 5 GB, 1,50 USD/mes. Se dimensionó cuando los videos esperaban acá (unos
+    # 100 de 50 MB a la vez); con los videos en Supabase sobra, pero el disco
+    # se agranda y no se achica. Si la tabla crece (p. ej. con el worker caído),
+    # Render agranda el disco antes de que la base deje de aceptar escrituras.
+    diskSizeGB: 5
+    storageAutoscalingEnabled: true
+    # Lista vacía = sin acceso desde internet: solo los servicios de arriba,
+    # por la red privada. Para entrar con psql o pg_dump desde afuera, se
+    # agrega la IP propia en el Dashboard, solo mientras haga falta.
+    ipAllowList: []

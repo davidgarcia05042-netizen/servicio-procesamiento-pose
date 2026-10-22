@@ -1,0 +1,41 @@
+# Dependencias de DESARROLLO. No van en la imagen de producción.
+#
+# POR QUÉ ESTÁN SEPARADAS: el Dockerfile instala solo requirements/, así que
+# todo lo que esté allá viaja a la imagen desplegada, se queda ocupando espacio
+# y entra en la superficie que escanea Trivy. pytest estaba en producción y se
+# instalaba en la imagen sin que nada lo usara.
+#
+# Instalación (trae también las de producción de TODAS las plataformas: la
+# suite prueba el código de cada una):
+#   pip install -r requirements-dev.txt
+
+-r requirements/render.txt
+-r requirements/gcp.txt
+
+# --- Monitor de la cola, para correrlo desde el venv ---
+# No va en producción: Render no lo despliega, y los docker compose usan la
+# imagen mher/flower. Estaba en requirements.txt y viajaba a la imagen, con su
+# servidor web (tornado) incluido, sin que nada lo usara.
+flower==2.0.1
+
+# --- Suite de tests ---
+pytest==9.1.1
+pytest-asyncio==1.4.0
+
+# --- Herramienta de medición (app/tools/benchmark_pipeline.py) ---
+# Sin psutil la herramienta corre igual, pero el pico de RAM por corrida sale
+# como "n/d": en Linux cae a getrusage, que reporta el máximo acumulado de TODO
+# el proceso y no el de cada corrida. O sea que uno de los tres objetivos de la
+# medición (tiempo, CPU y RAM) queda sin cubrir.
+psutil==7.2.2
+
+# --- Validación del blueprint de Render ---
+# render.yaml se valida contra el JSON Schema oficial de Render (ver README,
+# "Validar el blueprint antes de subirlo"). Un blueprint mal escrito se
+# descubriría recién al crearlo en el Dashboard.
+jsonschema==4.26.0
+# PyYAML ya llega a producción por `uvicorn[standard]` (y por kombu, fastapi y
+# starlette), pero se declara igual: acá se usa de forma directa, y depender de
+# que otro paquete lo arrastre es depender de un detalle que puede cambiar en
+# cualquier actualización.
+pyyaml==6.0.3

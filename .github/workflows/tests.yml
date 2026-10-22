@@ -1,0 +1,177 @@
+name: Tests
+
+# QUÉ PROBLEMA RESUELVE: hasta ahora ningún workflow corría la suite. El
+# repositorio solo tenía escaneos de seguridad (pip-audit, bandit, Trivy), así
+# que un PR con tests rotos se veía en verde y la convención de docs/DECISIONES_TECNICAS.md --
+# "todo cambio de código se verifica con la suite correspondiente antes de
+# entregarse" -- dependía por completo de que alguien se acordara de correrla.
+
+on:
+  # A diferencia de security-scan.yml, acá `push` se limita a main. Ese
+  # workflow corre en cada push Y en cada pull_request, lo que en una rama con
+  # PR abierto significa dos corridas idénticas por cada push. Para los
+  # escaneos da igual porque son baratos; esta suite instala mediapipe y
+  # opencv, así que duplicarla sí se nota. Con esta combinación cada cambio se
+  # verifica exactamente una vez: en su PR, y otra vez al entrar a main.
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Mínimo privilegio: este job solo necesita leer el repositorio.
+permissions:
+  contents: read
+
+# Dos pushes seguidos a la misma rama: la corrida vieja ya no aporta nada y
+# además hace cola delante de la nueva.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (suite completa)
+    runs-on: ubuntu-latest
+    # La instalación de mediapipe y opencv es lo lento. Si pasa de esto, algo
+    # se colgó: mejor cortar que dejar el runner ocupado media hora.
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Una sola versión, la misma que corre en producción (ver el
+          # Dockerfile). Una matriz de versiones probaría combinaciones que
+          # nunca se van a desplegar.
+          python-version: "3.12"
+          # El caché se invalida cuando cambia un archivo de dependencias, que
+          # es justo cuando tiene que reinstalarse. Van TODOS: requirements-dev.txt
+          # solo incluye a los de requirements/ con `-r`, así que con él solo
+          # un cambio en requirements/base.txt dejaba el caché viejo.
+          cache: pip
+          cache-dependency-path: |
+            requirements-dev.txt
+            requirements/*.txt
+
+      - name: Librerías de sistema para OpenCV
+        # tests/conftest.py importa cv2 a nivel de módulo, así que sin esto
+        # falla la recolección entera, no un test suelto.
+        #
+        # Es la misma razón que en el Dockerfile: mediapipe depende de
+        # opencv-contrib-python (la variante NO headless), que al importarse
+        # carga libGL.so.1 y libgthread. Los runners de GitHub no las traen.
+        #
+        # El nombre del paquete de glib cambió a `libglib2.0-0t64` en las
+        # distribuciones con la transición de time_t a 64 bits; el respaldo
+        # cubre una imagen de runner anterior a ese cambio.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0t64 \
+            || sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0
+
+      - name: Instalar dependencias
+        # requirements-dev.txt incluye las de cada plataforma con `-r`, así que
+        # esto trae las de producción también.
+        run: pip install -r requirements-dev.txt
+
+      - name: PostgreSQL para los videos en la base (Render)
+        # tests/test_render_postgres_storage.py guarda, lee y borra videos de
+        # verdad en la tabla `videos`, y prueba el ciclo del job contra
+        # PostgreSQL: que un worker que termina después del barrido no pise su
+        # cierre. Cada test trabaja en su propia base.
+        run: |
+          docker run -d --name pg-render -e POSTGRES_PASSWORD=postgres -p 127.0.0.1:5432:5432 postgres:16-alpine
+          for i in $(seq 1 60); do
+            if docker logs pg-render 2>&1 | grep -q "init process complete" \
+              && docker exec pg-render pg_isready -q -U postgres; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "PostgreSQL no arrancó"; docker logs pg-render; exit 1
+
+      - name: Emulador de Cloud Storage
+        # Los tests del almacenamiento de Google Cloud (tests/test_gcp_storage.py)
+        # suben, bajan y borran de verdad contra fake-gcs-server, que habla la
+        # misma API JSON que Cloud Storage (es el mismo emulador de la demo).
+        # Sin esto se saltarían, y el adaptador quedaría sin probar contra
+        # nada real hasta el primer despliegue.
+        #
+        # Va con `docker run` y no como `services:` porque el emulador necesita
+        # argumentos de arranque, y `services:` no los admite. -external-url
+        # hace falta para las subidas reanudables (videos de más de 8 MB).
+        run: |
+          docker run -d --name gcs -p 127.0.0.1:4443:4443 fsouza/fake-gcs-server:1 \
+            -scheme http -port 4443 -backend memory -external-url http://localhost:4443
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:4443/storage/v1/b > /dev/null && exit 0
+            sleep 1
+          done
+          echo "El emulador de Cloud Storage no arrancó"; docker logs gcs; exit 1
+
+      - name: PostgreSQL por socket, como Cloud SQL en Cloud Run
+        # tests/test_gcp_database.py corre las migraciones y lee y escribe
+        # jobs contra un PostgreSQL real que escucha en un socket Unix con la
+        # misma forma de ruta que Cloud Run le da a Cloud SQL
+        # (/cloudsql/proyecto:región:instancia, con los dos puntos). El
+        # directorio se comparte con el runner, que es donde corre pytest.
+        #
+        # Se espera al mensaje de fin de inicialización y no solo a
+        # pg_isready: la imagen arranca un servidor temporal para inicializar,
+        # lo apaga y arranca el definitivo, y pg_isready ya responde con el
+        # temporal.
+        run: |
+          mkdir -p "/tmp/cloudsql/proyecto-pruebas:us-central1:pose-db"
+          chmod -R 777 /tmp/cloudsql
+          docker run -d --name cloudsql -e POSTGRES_PASSWORD=postgres -v /tmp/cloudsql:/cloudsql \
+            postgres:16-alpine \
+            -c "unix_socket_directories=/var/run/postgresql,/cloudsql/proyecto-pruebas:us-central1:pose-db"
+          for i in $(seq 1 60); do
+            if docker logs cloudsql 2>&1 | grep -q "init process complete" \
+              && docker exec cloudsql pg_isready -q -h "/cloudsql/proyecto-pruebas:us-central1:pose-db"; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "PostgreSQL no arrancó"; docker logs cloudsql; exit 1
+
+      - name: Emulador de Cloud Tasks
+        # tests/test_gcp_tasks.py encola de verdad contra el emulador, que le
+        # entrega cada tarea por HTTP a un worker que el test levanta en el
+        # runner, firmada con un token OIDC que el worker verifica contra las
+        # claves del emulador (/jwks, puerto 8980).
+        #
+        # --add-host: desde el contenedor, el runner es host.docker.internal.
+        run: |
+          docker run -d --name tareas -p 127.0.0.1:8123:8123 -p 127.0.0.1:8980:8980 \
+            --add-host=host.docker.internal:host-gateway \
+            ghcr.io/aertje/cloud-tasks-emulator:2.0.1 -host 0.0.0.0 -port 8123 \
+            -openid-issuer http://localhost:8980 \
+            -initial-queue projects/proyecto-pruebas/locations/us-central1/queues/pose-videos \
+            -initial-queue projects/proyecto-pruebas/locations/us-central1/queues/pose-callbacks
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8980/.well-known/openid-configuration > /dev/null && exit 0
+            sleep 1
+          done
+          echo "El emulador de Cloud Tasks no arrancó"; docker logs tareas; exit 1
+
+      - name: Correr la suite
+        # Casi toda la suite usa dobles en lugar de los servicios externos. Las
+        # excepciones son los dos PostgreSQL (por TCP y por socket) y Cloud
+        # Storage y Cloud Tasks (los emuladores), de los pasos anteriores. Lo que NO cubre son los fallos que solo
+        # aparecen contra servicios reales (la autenticación de Redis, el
+        # barrido con Celery Beat, los permisos de la cuenta de servicio en
+        # Google); esos se verifican a mano y quedan documentados en el
+        # README.
+        #
+        # Si la recolección no encuentra ningún test, pytest termina con
+        # código 5 y el job falla. Es lo que se quiere: una suite vacía no es
+        # una suite que pasa.
+        env:
+          POSTGRES_URL_FOR_TESTS: postgresql://postgres:postgres@localhost:5432/postgres
+          GCS_EMULATOR_FOR_TESTS: http://localhost:4443
+          CLOUDSQL_SOCKET_DIR_FOR_TESTS: /tmp/cloudsql
+          CLOUD_TASKS_EMULATOR_FOR_TESTS: localhost:8123
+          CLOUD_TASKS_TARGET_HOST_FOR_TESTS: host.docker.internal
+        run: pytest -q

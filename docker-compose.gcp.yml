@@ -1,0 +1,154 @@
+# EL CAMINO DE GOOGLE CLOUD, EN LOCAL, con emuladores. Es el equivalente de
+# docker-compose.demo.yml (el camino de Render) para la plataforma gcp:
+#
+#   docker compose -f docker-compose.gcp.yml up --build
+#
+# y en otra terminal (con el venv activo), con un video SIN datos de pacientes:
+#
+#   python -m app.tools.demo_send <video.mp4>
+#
+# QUÉ CORRE ACÁ: la etapa `gcp` del Dockerfile, con la API y el worker como dos
+# servicios separados, igual que en Cloud Run. La API encola en Cloud Tasks, y
+# Cloud Tasks le entrega cada tarea al worker por HTTP con un token OIDC que el
+# worker verifica. Lo simulado:
+#
+#   - `tareas`: emulador de Cloud Tasks. Habla la misma API gRPC, entrega por
+#     HTTP y firma los tokens con su propia clave, que publica en /jwks.
+#   - `gcs`: emulador de Cloud Storage (el mismo de la demo de Render).
+#   - `postgres`: escucha en un socket Unix con la misma ruta que Cloud Run le
+#     da a Cloud SQL (/cloudsql/<proyecto>:<región>:<instancia>), compartido
+#     con la API y el worker por un volumen.
+#   - `programador`: hace de Cloud Scheduler, que no tiene emulador. Cuando
+#     vence una tarea periódica, la crea en el emulador de Cloud Tasks hacia
+#     POST /cron/<nombre> del worker (ver app/tools/local_scheduler.py).
+#   - `receptor`: hace de plataforma de telefisioterapia y recibe el callback.
+#
+# ES AUTOCONTENIDO: no lee el .env. Los secretos de abajo son públicos y solo
+# sirven acá. Solo la API y el receptor se publican, y solo en 127.0.0.1.
+# NADA PERSISTE: `docker compose -f docker-compose.gcp.yml down -v` borra todo.
+
+x-gcp-env: &gcp-env
+  # Desarrollo: los emuladores están prohibidos en producción (ver
+  # app/platforms/gcp/config.py).
+  ENVIRONMENT: development
+  PLATFORM: gcp
+  DATABASE_URL: postgresql+asyncpg://postgres:postgres@/pose_service?host=/cloudsql/proyecto-local:us-central1:pose-db
+  GCS_BUCKET: pose-local
+  STORAGE_EMULATOR_HOST: http://gcs:4443
+  GCP_PROJECT: proyecto-local
+  GCP_REGION: us-central1
+  TASKS_VIDEO_QUEUE: pose-videos
+  TASKS_CALLBACK_QUEUE: pose-callbacks
+  CLOUD_TASKS_EMULATOR_HOST: tareas:8123
+  WORKER_URL: http://worker:8080
+  TASKS_SERVICE_ACCOUNT: pose-tasks@proyecto-local.iam.gserviceaccount.com
+  # El emulador firma los tokens con su clave; en producción se exigen los de
+  # Google (ver app/platforms/gcp/config.py).
+  TASKS_OIDC_ISSUER: http://tareas:8980
+  TASKS_OIDC_JWKS_URL: http://tareas:8980/jwks
+  # El mismo valor que DEMO_SECRET en app/tools/demo_send.py.
+  HMAC_SECRET: demo-secreto-solo-local
+  HMAC_ENFORCE: "true"
+  CALLBACK_ALLOWED_HOSTS: receptor
+  POSE_MODEL: mediapipe_heavy
+
+x-gcp-app: &gcp-app
+  build:
+    context: .
+    target: gcp
+  environment: *gcp-env
+  volumes:
+    - cloudsql:/cloudsql
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: pose_service
+    volumes:
+      - cloudsql:/cloudsql
+    # El directorio del socket tiene que existir y ser de postgres antes de
+    # arrancar. /var/run/postgresql sigue en la lista porque es el que usa la
+    # imagen para inicializar la base.
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        mkdir -p '/cloudsql/proyecto-local:us-central1:pose-db'
+        && chown postgres '/cloudsql/proyecto-local:us-central1:pose-db'
+        && exec docker-entrypoint.sh postgres
+        -c 'unix_socket_directories=/var/run/postgresql,/cloudsql/proyecto-local:us-central1:pose-db'
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-h", "/cloudsql/proyecto-local:us-central1:pose-db"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  gcs:
+    image: fsouza/fake-gcs-server:1
+    command: ["-scheme", "http", "-port", "4443", "-backend", "memory", "-external-url", "http://gcs:4443"]
+
+  tareas:
+    image: ghcr.io/aertje/cloud-tasks-emulator:2.0.1
+    command:
+      - -host=0.0.0.0
+      - -port=8123
+      - -openid-issuer=http://tareas:8980
+      - -initial-queue=projects/proyecto-local/locations/us-central1/queues/pose-videos
+      - -initial-queue=projects/proyecto-local/locations/us-central1/queues/pose-callbacks
+      # La de `programador`: en Google, Cloud Scheduler llama directo.
+      - -initial-queue=projects/proyecto-local/locations/us-central1/queues/pose-cron
+
+  migraciones:
+    <<: *gcp-app
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *gcp-app
+    ports:
+      - "127.0.0.1:8000:8080"
+    depends_on:
+      migraciones:
+        condition: service_completed_successfully
+      gcs:
+        condition: service_started
+      tareas:
+        condition: service_started
+
+  worker:
+    <<: *gcp-app
+    command: ["sh", "-c", "exec uvicorn app.platforms.gcp.worker:app --host 0.0.0.0 --port 8080"]
+    depends_on:
+      migraciones:
+        condition: service_completed_successfully
+      gcs:
+        condition: service_started
+      tareas:
+        condition: service_started
+
+  programador:
+    <<: *gcp-app
+    command: ["python", "-m", "app.tools.local_scheduler"]
+    environment:
+      <<: *gcp-env
+      # Cada minuto y no cada 15, para que el resumen de estado se vea en el
+      # log sin esperar (igual que en la demo de Render).
+      STATUS_REPORT_INTERVAL_MINUTES: "1"
+    depends_on:
+      worker:
+        condition: service_started
+
+  receptor:
+    build:
+      context: .
+      target: gcp
+    environment: *gcp-env
+    command: ["python", "-m", "app.tools.demo_receiver"]
+    ports:
+      - "127.0.0.1:9099:9099"
+
+volumes:
+  cloudsql:

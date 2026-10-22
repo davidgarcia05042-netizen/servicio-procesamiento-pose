@@ -1,0 +1,13 @@
+# Plataforma Render (app/platforms/render/): la cola es Celery con Redis como
+# broker/backend, y Celery Beat dispara las tareas periódicas. Flower, el
+# monitor de la cola, está en requirements-dev.txt: en producción no se
+# despliega.
+#
+# El video va a Supabase Storage (con httpx, que ya está en base.txt) o a
+# Firebase (firebase-admin), según STORAGE_BACKEND.
+
+-r base.txt
+
+celery==5.4.0
+redis==5.0.8
+firebase-admin==6.5.0

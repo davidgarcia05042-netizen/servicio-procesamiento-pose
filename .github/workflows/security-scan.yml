@@ -1,0 +1,128 @@
+name: Security Scan
+
+on:
+  push:
+  pull_request:
+  # Semanal aunque nadie haga push: las vulnerabilidades nuevas se publican
+  # sobre dependencias y paquetes del sistema que no cambiaron. Sin esto, un
+  # CVE que aparece un martes no se ve hasta el próximo commit.
+  schedule:
+    - cron: "0 11 * * 1" # lunes 06:00 hora de Bogotá
+  workflow_dispatch:
+
+# Mínimo privilegio: estos jobs solo necesitan leer el repositorio.
+permissions:
+  contents: read
+
+jobs:
+  # Vulnerabilidades conocidas (CVE) en las dependencias.
+  #
+  # SOBRE EL FILTRO POR SEVERIDAD: pip-audit NO expone severidad. Sus registros
+  # traen id, aliases, fix_versions y description -- sin CVSS -- así que no hay
+  # un "--severity high" que se pueda usar. La alternativa sería consultar la
+  # API de OSV por cada aviso, pero muchos avisos de PyPI ni siquiera publican
+  # CVSS, así que el filtro quedaría a medias y daría una falsa sensación de
+  # cobertura. Se falla ante CUALQUIER vulnerabilidad conocida y se triagea
+  # explícitamente con --ignore-vuln lo que se decida aceptar, dejando por
+  # escrito el motivo.
+  dependency-audit:
+    name: pip-audit (dependencias)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar pip-audit
+        run: pip install pip-audit==2.10.1
+
+      - name: Auditar dependencias
+        # Audita lo que se despliega en cada plataforma (requirements/), no el
+        # entorno del runner, que además trae las herramientas de CI. Cada
+        # archivo de plataforma incluye a base.txt, así que base.txt se audita
+        # dentro de cada uno.
+        #
+        # EXCEPCIONES ACEPTADAS (cada una con motivo y condición de salida):
+        #
+        # PYSEC-2026-1805 / CVE-2026-0994 -- protobuf 4.25.9
+        #   Qué es: DoS por recursión en google.protobuf.json_format.ParseDict()
+        #   al parsear mensajes Any anidados controlados por un atacante.
+        #   Por qué no se corrige: mediapipe 0.10.14 exige protobuf<5, y el fix
+        #   está en 5.29.6. Subir mediapipe puede cambiar los resultados de pose
+        #   y dejar sin validez las mediciones contra gold standard hechas en
+        #   pose-evaluation-service con esta versión.
+        #   Por qué el riesgo es bajo: ni app/ ni mediapipe llaman a
+        #   json_format. Solo lo usan clientes de Google (Firestore REST,
+        #   api_core) que llegan por firebase-admin (Render) y por
+        #   google-cloud-storage (Google Cloud), y parsean respuestas de las
+        #   APIs de Google sobre TLS, nunca entrada de la plataforma.
+        #   Retirar la excepción cuando: se actualice mediapipe a una versión
+        #   que acepte protobuf>=5.29.6 (y se revaliden las mediciones).
+        run: |
+          for file in requirements/*.txt; do
+            [ "$file" = requirements/base.txt ] && continue
+            echo "::group::$file"
+            pip-audit -r "$file" --progress-spinner off --ignore-vuln PYSEC-2026-1805
+            echo "::endgroup::"
+          done
+
+  # Análisis estático del código propio.
+  #
+  # Acá el filtro por severidad SÍ es nativo: bandit clasifica cada hallazgo en
+  # LOW/MEDIUM/HIGH. Se exige confianza media para arriba para no romper el
+  # pipeline con coincidencias dudosas.
+  static-analysis:
+    name: bandit (código)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar bandit
+        run: pip install bandit==1.9.4
+
+      - name: Analizar app/
+        # Solo app/: en tests/ el uso de assert y de subprocess es legítimo y
+        # generaría ruido sin valor.
+        run: bandit -r app --severity-level high --confidence-level medium
+
+  # Vulnerabilidades de la imagen Docker que realmente se despliega: paquetes
+  # del sistema operativo de la base Y paquetes de Python instalados.
+  image-scan:
+    name: trivy (imagen Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Construir imagen
+        run: docker build --target render -t pose-service:${{ github.sha }} .
+
+      - name: Escanear con Trivy
+        # Fijada por SHA de commit, no por tag: un tag se puede mover para
+        # apuntar a otro código, y esta action corre con acceso al repositorio.
+        # Es la v0.36.0. Dependabot (ecosistema github-actions) propone las
+        # actualizaciones del SHA.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: pose-service:${{ github.sha }}
+          # Fijada para que el resultado no cambie solo porque salió un Trivy
+          # nuevo; es la que trae por defecto la v0.36.0 de la action.
+          version: v0.70.0
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          # SIN PARCHE PUBLICADO NO BLOQUEA: la mayoría de los hallazgos en
+          # paquetes del sistema (util-linux, libxml2...) no tienen fix de
+          # Debian todavía. Bloquear por ellos dejaría el pipeline rojo de
+          # forma permanente por algo que nadie puede arreglar, y un pipeline
+          # siempre rojo se termina ignorando. En cuanto Debian publique el
+          # parche, el hallazgo pasa a bloquear y el `apt-get upgrade` del
+          # Dockerfile lo corrige al reconstruir. Por eso existe el escaneo
+          # semanal programado.
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+          format: table

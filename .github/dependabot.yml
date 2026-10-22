@@ -1,0 +1,70 @@
+version: 2
+
+updates:
+  # Dependencias de Python: requirements/ (las comunes y las de cada
+  # plataforma) y requirements-dev.txt en la raíz.
+  - package-ecosystem: pip
+    directories:
+      - "/"
+      - "/requirements"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/Bogota
+    open-pull-requests-limit: 5
+    labels:
+      - dependencias
+      - seguridad
+    commit-message:
+      prefix: "deps"
+    groups:
+      # Un PR por grupo en vez de uno por paquete: fastapi, starlette y
+      # python-multipart se mueven juntos (fastapi fija el rango de starlette),
+      # así que separarlos produce PRs que no pueden mezclarse solos.
+      fastapi-stack:
+        patterns:
+          - fastapi
+          - starlette
+          - python-multipart
+          - uvicorn*
+          - pydantic*
+      celery-stack:
+        patterns:
+          - celery
+          - redis
+          - flower
+      gcp-stack:
+        patterns:
+          - google-cloud-*
+          - pyjwt
+      # Actualizaciones menores y de parche del resto, agrupadas para no
+      # inundar de PRs. Las mayores llegan por separado, que es cuando hay que
+      # mirar con cuidado.
+      resto-menores:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # Desde 2.24 exige protobuf>=6, y mediapipe 0.10.14 exige protobuf<5
+      # (ver requirements/gcp.txt): esos PRs no pueden instalarse nunca. Se
+      # quita junto con la actualización de mediapipe.
+      - dependency-name: google-cloud-tasks
+        versions: [">=2.24"]
+
+  # Las propias GitHub Actions también se quedan viejas y son superficie de
+  # ataque (una action comprometida corre con acceso al repositorio).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/Bogota
+    labels:
+      - dependencias
+      - seguridad
+    commit-message:
+      prefix: "ci"

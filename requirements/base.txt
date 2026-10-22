@@ -1,0 +1,41 @@
+# Dependencias COMUNES a todas las plataformas de despliegue.
+#
+# Lo propio de cada plataforma va en su archivo, que incluye este con -r:
+#   requirements/render.txt   Celery + Redis, Firebase
+#   requirements/gcp.txt      Cloud Storage
+# El Dockerfile instala el de la plataforma que construye (ver sus etapas), así
+# que la imagen de una plataforma no carga las dependencias de otra.
+
+fastapi==0.141.1
+# Fijada explícitamente aunque la trae fastapi: fastapi acepta starlette>=0.46,
+# rango que incluye versiones con vulnerabilidades conocidas (pip-audit).
+starlette==1.6.0
+uvicorn[standard]==0.30.6
+# Parsea los uploads de POST /video/. Las versiones < 0.0.31 tienen avisos de
+# DoS por datos malformados alrededor de los boundaries.
+python-multipart==0.0.32
+pydantic==2.9.2
+pydantic-settings==2.5.2
+slowapi==0.1.10
+
+# Base de datos (PostgreSQL con columna JSONB para el payload variable de resultados)
+sqlalchemy[asyncio]==2.0.35
+asyncpg==0.29.0
+alembic==1.20.0
+
+# Modelos de pose (los ya validados en pose-evaluation-service)
+mediapipe==0.10.14
+# opencv-contrib-python y NO opencv-python-headless: mediapipe exige la variante
+# contrib, y las dos distribuciones escriben en el MISMO directorio cv2/ -- la
+# que se instala última pisa a la otra. Tener ambas dejaba el pin de headless
+# como letra muerta y el cv2 real (contrib) sin versión fija. Se fija la que
+# efectivamente corre.
+opencv-contrib-python==4.11.0.86
+numpy==1.26.4
+
+# Callback (webhook) de vuelta a la plataforma
+httpx==0.27.2
+
+# Las dependencias de desarrollo (pytest, psutil, jsonschema...) viven en
+# requirements-dev.txt: este archivo y el de cada plataforma son EXACTAMENTE lo
+# que se instala en la imagen de producción.
