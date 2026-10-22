@@ -39,7 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           # Una sola versión, la misma que corre en producción (ver el
           # Dockerfile). Una matriz de versiones probaría combinaciones que
