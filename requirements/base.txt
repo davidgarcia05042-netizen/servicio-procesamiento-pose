@@ -6,16 +6,16 @@
 # El Dockerfile instala el de la plataforma que construye (ver sus etapas), así
 # que la imagen de una plataforma no carga las dependencias de otra.
 
-fastapi==0.141.1
+fastapi==0.146.0
 # Fijada explícitamente aunque la trae fastapi: fastapi acepta starlette>=0.46,
 # rango que incluye versiones con vulnerabilidades conocidas (pip-audit).
-starlette==1.6.0
-uvicorn[standard]==0.30.6
+starlette==1.9.0
+uvicorn[standard]==0.54.0
 # Parsea los uploads de POST /video/. Las versiones < 0.0.31 tienen avisos de
 # DoS por datos malformados alrededor de los boundaries.
 python-multipart==0.0.32
-pydantic==2.9.2
-pydantic-settings==2.5.2
+pydantic==2.14.1
+pydantic-settings==2.16.0
 slowapi==0.1.10
 
 # Base de datos (PostgreSQL con columna JSONB para el payload variable de resultados)
