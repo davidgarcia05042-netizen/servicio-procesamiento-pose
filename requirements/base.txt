@@ -31,7 +31,7 @@ mediapipe==0.10.14
 # como letra muerta y el cv2 real (contrib) sin versión fija. Se fija la que
 # efectivamente corre.
 opencv-contrib-python==4.11.0.86
-numpy==1.26.4
+numpy==2.5.4
 
 # Callback (webhook) de vuelta a la plataforma
 httpx==0.27.2
