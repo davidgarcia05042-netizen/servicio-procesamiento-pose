@@ -9,7 +9,7 @@
 
 -r base.txt
 
-google-cloud-storage==3.16.0
+google-cloud-storage==3.17.1
 # NO SUBIR de 2.23.0 sin revisar protobuf: desde 2.24, google-cloud-tasks exige
 # protobuf>=6, y mediapipe 0.10.14 (base.txt) exige protobuf<5. Es la misma
 # restricción que la excepción de pip-audit (ver security-scan.yml): se
