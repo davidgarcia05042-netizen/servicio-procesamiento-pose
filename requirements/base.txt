@@ -30,7 +30,7 @@ mediapipe==0.10.14
 # que se instala última pisa a la otra. Tener ambas dejaba el pin de headless
 # como letra muerta y el cv2 real (contrib) sin versión fija. Se fija la que
 # efectivamente corre.
-opencv-contrib-python==4.11.0.86
+opencv-contrib-python==5.0.0.93
 numpy==1.26.4
 
 # Callback (webhook) de vuelta a la plataforma
