@@ -1,0 +1,134 @@
+# DEMO LOCAL del servicio completo, sin Render.
+#
+#   docker compose -f docker-compose.demo.yml up --build
+#
+# y en otra terminal (con el venv activo):
+#
+#   python -m app.tools.demo_send ruta\al\video.mp4
+#
+# Guion completo en la sección "Demo local" del README.
+#
+# QUÉ CORRE ACÁ: exactamente la misma imagen que se desplegaría (Dockerfile),
+# con la API, el worker y Beat como procesos separados, igual que en
+# deploy/render/render.yaml. El video espera en PostgreSQL, como en Render
+# (STORAGE_BACKEND=postgres), así que nunca sale de la máquina. Lo único
+# simulado es el extremo que no es nuestro:
+#
+#   - `receptor`: hace de plataforma de telefisioterapia y recibe el callback.
+#
+# ES AUTOCONTENIDO A PROPÓSITO: no lee el .env, así que cualquiera del equipo
+# lo levanta sin configurar nada. Los secretos de abajo son públicos y solo
+# sirven acá. Nada se publica fuera de 127.0.0.1, y PostgreSQL y Redis ni
+# siquiera se publican: solo los ven los contenedores.
+#
+# NADA PERSISTE: `docker compose -f docker-compose.demo.yml down` borra todo,
+# videos y resultados incluidos. Es lo que se quiere con datos de una persona.
+
+x-app-env: &app-env
+  ENVIRONMENT: development
+  DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/pose_service
+  REDIS_BROKER_URL: redis://redis:6379/0
+  REDIS_BACKEND_URL: redis://redis:6379/1
+  # El de producción: el video espera en la misma base (tabla `videos`).
+  STORAGE_BACKEND: postgres
+  # El mismo valor que DEMO_SECRET en app/tools/demo_send.py.
+  HMAC_SECRET: demo-secreto-solo-local
+  # Estricto, como debería quedar en producción cuando la plataforma firme:
+  # así la demo muestra el flujo real y `demo_send --sin-firma` recibe 401.
+  HMAC_ENFORCE: "true"
+  # `receptor` es un nombre sin punto, que el servicio rechaza por defecto por
+  # parecer un host interno. Ponerlo en la lista es la forma explícita de
+  # permitirlo, igual que en producción se pondrá el host de la plataforma.
+  CALLBACK_ALLOWED_HOSTS: receptor
+  POSE_MODEL: mediapipe_heavy
+
+# Sin `image:` fija a propósito: con el mismo nombre en varios servicios,
+# compose los construye en paralelo y choca al etiquetar ("already exists").
+# Cada uno etiqueta su propia imagen; la caché de capas hace que se construya
+# una sola vez de verdad.
+x-app: &app
+  # La etapa de Render del Dockerfile: la demo corre la cola con Celery + Redis.
+  build:
+    context: .
+    target: render
+  environment: *app-env
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: pose_service
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # El esquema lo crea Alembic, igual que el preDeployCommand de Render.
+  migraciones:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      migraciones:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  worker:
+    <<: *app
+    # Un solo proceso: en un portátil, dos videos con MediaPipe Heavy a la vez
+    # compiten por la CPU y la demo se ve más lenta de lo que es.
+    command: ["celery", "-A", "app.platforms.render.worker.celery", "worker", "--concurrency=1"]
+    depends_on:
+      migraciones:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  beat:
+    <<: *app
+    command: ["celery", "-A", "app.platforms.render.worker.celery", "beat"]
+    environment:
+      <<: *app-env
+      # Cada minuto y no cada 15, para que el resumen de estado se vea en el
+      # log durante la demo sin esperar.
+      STATUS_REPORT_INTERVAL_MINUTES: "1"
+    depends_on:
+      migraciones:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  receptor:
+    <<: *app
+    command: ["python", "-m", "app.tools.demo_receiver"]
+    ports:
+      - "127.0.0.1:9099:9099"
+
+  # Monitor de la cola: http://localhost:5555
+  flower:
+    image: mher/flower:2.0
+    command: ["celery", "--broker=redis://redis:6379/0", "flower", "--port=5555"]
+    ports:
+      - "127.0.0.1:5555:5555"
+    depends_on:
+      redis:
+        condition: service_healthy

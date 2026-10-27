@@ -1,0 +1,21 @@
+# Plataforma Google Cloud (app/platforms/gcp/). En construcción por etapas:
+# almacenamiento (Cloud Storage) y cola (Cloud Tasks hacia el worker en Cloud
+# Run). La base (Cloud SQL) no necesita nada propio: va por asyncpg, que está
+# en base.txt.
+#
+# Las credenciales las toman las librerías de la cuenta de servicio de Cloud
+# Run; no hace falta ninguna dependencia más para eso (google-auth viene con
+# estas).
+
+-r base.txt
+
+google-cloud-storage==3.16.0
+# NO SUBIR de 2.23.0 sin revisar protobuf: desde 2.24, google-cloud-tasks exige
+# protobuf>=6, y mediapipe 0.10.14 (base.txt) exige protobuf<5. Es la misma
+# restricción que la excepción de pip-audit (ver security-scan.yml): se
+# levanta junto con ella, al actualizar mediapipe.
+google-cloud-tasks==2.23.0
+
+# Verifica el token OIDC con el que Cloud Tasks firma cada tarea que le entrega
+# al worker (ver app/platforms/gcp/task_auth.py). Con [crypto] por RS256.
+pyjwt[crypto]==2.15.1

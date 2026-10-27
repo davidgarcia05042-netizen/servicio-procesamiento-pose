@@ -1,0 +1,26 @@
+# Lo que NUNCA debe quedar horneado en la imagen. Una imagen se sube a un
+# registro y cualquiera con acceso a él puede extraer sus capas: un secreto
+# copiado por error acá queda expuesto aunque después se borre del repo.
+.env
+*firebase*.json
+!firebase-credentials.example.json
+
+# Entorno local y artefactos
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+.github/
+
+# No hacen falta para servir ni procesar
+tests/
+tmp/
+logs/
+*.md
+deploy/
+docker-compose*.yml
+requirements-dev.txt
+*.mp4
+*.avi
+*.mov

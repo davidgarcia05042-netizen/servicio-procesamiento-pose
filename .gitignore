@@ -1,0 +1,20 @@
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Credenciales y configuración local -- NUNCA se suben
+.env
+*firebase*.json
+!firebase-credentials.example.json
+
+# Archivos temporales de procesamiento de video
+tmp/
+logs/
+*.mp4
+*.avi
+*.mov
+
+# Estado de Celery Beat (se regenera solo en cada arranque)
+celerybeat-schedule*
+celerybeat.pid

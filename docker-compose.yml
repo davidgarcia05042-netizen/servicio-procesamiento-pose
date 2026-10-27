@@ -1,0 +1,59 @@
+# Entorno de DESARROLLO local.
+#
+# TLS: acá Redis va SIN TLS (redis://) a propósito. Todo el tráfico se queda
+# dentro de la máquina o de la red del compose, nunca sale a internet, y montar
+# certificados para localhost solo agregaría fricción.
+#
+# EN RENDER (producción) ES DISTINTO Y NO ES OPCIONAL: la cola viaja entre
+# servicios por la red del proveedor, así que debe ir por TLS (rediss://). La
+# Key Value de Render ya entrega una URL rediss:// con credenciales — se pega
+# tal cual en REDIS_BROKER_URL/REDIS_BACKEND_URL. Con ENVIRONMENT=production el servicio
+# se niega a arrancar si la URL no es rediss:// (ver app/core/config.py).
+#
+# La contraseña sale de REDIS_PASSWORD en el .env; docker compose la sustituye
+# acá. Sin esa variable, el arranque falla en vez de levantar un Redis abierto.
+
+services:
+  redis:
+    image: redis:7-alpine
+    # Redis sin --requirepass acepta a cualquiera que alcance el puerto. Aun en
+    # local conviene, porque el puerto queda publicado en el host.
+    command: redis-server --requirepass ${REDIS_PASSWORD:?falta REDIS_PASSWORD en el .env}
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: pose_service
+    ports:
+      # 5433 en el HOST a propósito (dentro del contenedor sigue siendo 5432).
+      # Una instalación nativa de PostgreSQL ocupa el 5432 y haría que este
+      # contenedor no arranque. Con 5433 conviven sin pisarse.
+      # DATABASE_URL en el .env debe apuntar al 5433.
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # Monitoreo de la cola de Celery: http://localhost:5555
+  flower:
+    image: mher/flower:2.0
+    # La contraseña va también acá: Flower habla con el mismo Redis protegido.
+    # El usuario va nombrado ("default"), igual que en app/core/config.py: con
+    # usuario vacío, el cliente asíncrono de Celery no autentica contra Redis 6+.
+    command: celery --broker=redis://default:${REDIS_PASSWORD}@redis:6379/0 flower --port=5555
+    ports:
+      - "127.0.0.1:5555:5555"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

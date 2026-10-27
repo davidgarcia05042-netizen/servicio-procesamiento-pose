@@ -1,0 +1,16 @@
+# Excepciones aceptadas del escaneo de imagen con Trivy.
+# Cada entrada debe llevar: qué es, por qué no se corrige, por qué el riesgo es
+# aceptable y cuándo retirarla. Sin eso, no se agrega.
+
+# protobuf 4.25.9 -- DoS por recursión en json_format.ParseDict() con mensajes
+# Any anidados controlados por un atacante.
+# No se corrige: mediapipe 0.10.14 exige protobuf<5 y el fix está en 5.29.6;
+#   subir mediapipe puede cambiar los resultados de pose y dejar sin validez
+#   las mediciones contra gold standard de entorno-pruebas.
+# Riesgo bajo: ni app/ ni mediapipe llaman a json_format. Solo lo usan clientes
+#   de Google (Firestore REST, api_core) que llegan por firebase-admin y parsean
+#   respuestas de las APIs de Google sobre TLS, nunca entrada de la plataforma.
+# Retirar cuando: se actualice mediapipe a una versión compatible con
+#   protobuf>=5.29.6 y se revaliden las mediciones.
+# Es la misma excepción que PYSEC-2026-1805 en el job de pip-audit.
+CVE-2026-0994
